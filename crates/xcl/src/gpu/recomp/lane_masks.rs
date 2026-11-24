@@ -202,6 +202,18 @@ enum Atom {
     Opaque(u64, usize),
     /// an unresolved join of this slot (SGPR, `SCC`) at the start of this block
     Join(usize, usize),
+    /// EXEC at launch, where it need not hold every lane that runs (`LaunchExec::Unknown`)
+    Launch,
+}
+
+/// EXEC at the program's start, as the analysis takes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LaunchExec {
+    /// every lane that runs is in EXEC: kernel mode (lanes outside it leave at once) and compute
+    All,
+    /// unknown per lane: a PS, whose helper lanes start outside EXEC and run on. A vector
+    /// instruction keeps its guard until EXEC is written.
+    Unknown,
 }
 
 /// The masks at a program point. `regs[r]`: the lane function of the mask SGPR r holds (wave64:
@@ -259,6 +271,7 @@ fn is_vector(d: &Decoded) -> bool {
 struct Lanes<'a> {
     insts: &'a [Decoded],
     wave64: bool,
+    launch: LaunchExec,
     bdd: Bdd,
     atoms: HashMap<Atom, u32>,
     /// block each atom is born in
@@ -277,7 +290,7 @@ struct Lanes<'a> {
 }
 
 impl<'a> Lanes<'a> {
-    fn new(insts: &'a [Decoded], wave64: bool) -> R<Self> {
+    fn new(insts: &'a [Decoded], wave64: bool, launch: LaunchExec) -> R<Self> {
         let starts: HashMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
         let mut leaders = BTreeSet::from([0usize]);
         let mut target = vec![None; insts.len()];
@@ -405,7 +418,7 @@ impl<'a> Lanes<'a> {
                 (written, kill, d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_SSRC_SPECIAL_SCC"))
             })
             .collect();
-        Ok(Lanes { insts, wave64, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
+        Ok(Lanes { insts, wave64, launch, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
     }
 
     fn atom(&mut self, a: Atom, block: usize) -> R<B> {
@@ -693,7 +706,10 @@ impl<'a> Lanes<'a> {
     fn analyze(mut self) -> R<Summary> {
         let n = self.blocks.len();
         let mut entry = State { regs: vec![None; 128], scc: None };
-        entry.regs[EXEC] = Some(TRUE);
+        entry.regs[EXEC] = Some(match self.launch {
+            LaunchExec::All => TRUE,
+            LaunchExec::Unknown => self.atom(Atom::Launch, 0)?,
+        });
         let mut forced = HashSet::new();
         let mut reach = vec![FALSE; n];
         let mut ins: Vec<Option<State>> = vec![None; n];
@@ -795,12 +811,17 @@ impl<'a> Lanes<'a> {
     }
 }
 
-/// Analyses a decoded program (far jumps resolved).
+/// Analyses a decoded program (far jumps resolved) that starts with every lane in EXEC.
 pub fn analyze(insts: &[Decoded], wave64: bool) -> R<Summary> {
+    analyze_launch(insts, wave64, LaunchExec::All)
+}
+
+/// Analyses a decoded program (far jumps resolved) that starts with EXEC as `launch` says.
+pub fn analyze_launch(insts: &[Decoded], wave64: bool, launch: LaunchExec) -> R<Summary> {
     if insts.is_empty() {
         return Ok(Summary::default());
     }
-    Lanes::new(insts, wave64)?.analyze()
+    Lanes::new(insts, wave64, launch)?.analyze()
 }
 
 /// Decodes and analyses a program.
@@ -944,5 +965,46 @@ mod tests {
         assert_eq!(two_entries.unwrap_err(), "irreducible control flow");
         assert_eq!(run(&[("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 0)]), ENDPGM]).unwrap_err(), "indirect jump");
         assert_eq!(run(&[MOV2, ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFE)]), ENDPGM]).unwrap_err(), "branch to the entry");
+    }
+
+    fn run_launch(lines: &[I], launch: LaunchExec) -> R<Summary> {
+        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let d = rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        rdna2::resolve_far_jumps(&mut insts);
+        analyze_launch(&insts, true, launch)
+    }
+
+    #[test]
+    fn a_lane_outside_exec_at_launch_keeps_its_guard_until_exec_is_written() {
+        // v_mov (a helper lane must not write); exec = -1; v_mov (every lane writes)
+        let p = [MOV2, ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)]), MOV3, ENDPGM];
+        let all = run_launch(&p, LaunchExec::All).unwrap();
+        assert_eq!((all.vector, all.guarded.len()), (2, 0));
+        let unknown = run_launch(&p, LaunchExec::Unknown).unwrap();
+        assert_eq!(unknown.guarded, vec![0], "only the v_mov before EXEC is written");
+    }
+
+    #[test]
+    fn a_lane_branch_still_proves_exec_when_the_launch_exec_is_unknown() {
+        // as `a_skipped_if_needs_no_guard`: inside the if only lanes with their bit run, but the
+        // restored EXEC after the join is the launch EXEC again
+        let p = [
+            CMP,
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            MOV2,
+            RESTORE,
+            MOV3,
+            ENDPGM,
+        ];
+        assert_eq!(run_launch(&p, LaunchExec::All).unwrap().guarded.len(), 0);
+        let s = run_launch(&p, LaunchExec::Unknown).unwrap();
+        assert_eq!((s.vector, s.guarded.clone(), s.lane_branches), (2, vec![20], 1));
     }
 }
