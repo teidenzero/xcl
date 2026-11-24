@@ -1565,6 +1565,9 @@ impl<I: Ir> Lower<'_, I> {
         let writes = explicit_w.iter().fold(written, |m, &r| m | 1u128 << r);
         // `v_cmpx_*`: EXEC goes in as this lane's bit and comes back as its bit of the result
         let cmpx = name.starts_with("V_CMPX");
+        // an export (VS / PS): EXEC goes in only as the guard, which #1426's `export_gfx` takes
+        // for the lanes whose outputs it sets
+        let export = d.enc.name == "ENC_EXP";
         if writes & (3 << 126) != 0 && !cmpx {
             return Err("writes EXEC".into());
         }
@@ -1587,7 +1590,7 @@ impl<I: Ir> Lower<'_, I> {
         let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
         let mut inputs: Vec<(Var, I::V)> = Vec::new();
         // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
-        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125 && !(cmpx && r >= EXEC)) {
+        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125 && !((cmpx || export) && r >= EXEC)) {
             let v = self.read_num(b, r)?;
             inputs.push((Var::S(r), v));
         }

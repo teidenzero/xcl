@@ -36,6 +36,12 @@ struct DxilIr {
     /// lowering takes `lane()` before `compute_ids`, and in the split form the console lane
     /// is not the hardware lane (the upper half's are 32-63)
     ids: Option<(Value, [Value; 3])>,
+    /// a VS / PS: its start, set up in `Lw`'s entry block by the constructor (#1426's
+    /// `setup_vertex` / `setup_pixel`, whose input loads must come before every use): the
+    /// initial VGPRs the program names, and the lane's bit of the launch EXEC (`ballot(true)`,
+    /// without a PS's helper lanes). Cross-lane operations then go through `Lw`'s, which know a
+    /// wave32 program's half in 64-lane hardware and a PS's helper lanes.
+    graphics: Option<(Vec<(u16, Value)>, Value)>,
 }
 
 impl DxilIr {
@@ -81,11 +87,37 @@ impl DxilIr {
                 ids = Some(lw.setup_lanes_compute(cs.threads, lds));
                 true
             }
+            Entry::Vertex(_) | Entry::Pixel(_) => {
+                lw.setup_lanes_gfx();
+                true
+            }
             _ => false,
+        };
+        // a VS / PS's start, in `Lw`'s entry block as `kernel.rs` sets it up
+        let graphics = match entry {
+            Entry::Vertex(_) | Entry::Pixel(_) => {
+                use crate::gpu::dxil::lower::VAR_VGPR;
+                let used: BTreeSet<u64> = insts
+                    .iter()
+                    .flat_map(|d| {
+                        let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                        r.into_iter().chain(w)
+                    })
+                    .collect();
+                match entry {
+                    Entry::Vertex(vs) => lw.setup_vertex(vs, &used),
+                    Entry::Pixel(ps) => lw.setup_pixel(ps, &crate::gpu::recomp::emit::ps_attr_modes(insts, ps.input_ena)),
+                    _ => unreachable!(),
+                }
+                let vgprs = used.iter().map(|&v| (v as u16, lw.rd(VAR_VGPR + v as u32))).collect();
+                let (lo, hi) = (lw.rd(126), lw.rd(127));
+                Some((vgprs, lw.lanebit(lo, hi)))
+            }
+            _ => None,
         };
         let io = lw.init.io.expect("the I/O buffer");
         let (res, mem) = (lw.res, lw.mems[0]);
-        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set, ids }
+        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set, ids, graphics }
     }
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
@@ -215,8 +247,9 @@ impl Ir for DxilIr {
         self.lw.split
     }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
-        if self.lw.split {
-            // this half's word from the hardware, the other's through the exchange
+        if self.lw.split || self.graphics.is_some() {
+            // split: this half's word from the hardware, the other's through the exchange; a
+            // VS / PS: a wave32 program's half in 64-lane hardware
             let (lo, hi) = self.lw.ballot(c);
             return [lo, hi];
         }
@@ -234,6 +267,16 @@ impl Ir for DxilIr {
             return [w[0], w[0]];
         }
         self.ballot(c)
+    }
+    fn graphics_start(&mut self, vregs: &[u16]) -> Option<lower::GraphicsStart<Value>> {
+        let (vgprs, exec) = self.graphics.as_ref()?;
+        let vgprs = vgprs.iter().copied().filter(|(v, _)| vregs.contains(v)).collect();
+        Some(lower::GraphicsStart { sgprs: Vec::new(), vgprs, exec: *exec })
+    }
+    // #1426's end of the stage: the PS discard, then the outputs the exports left in `Lw`'s
+    // temporaries, which reach this block through `Lw`'s SSA (the branches go through `Lw`)
+    fn graphics_end(&mut self) {
+        self.lw.finish_gfx();
     }
     /// #1426's semantics of `d` (`Lw::inst_guarded`) in the current block: the inputs are written
     /// into `Lw`'s SSA there first, so it reads them and nothing from other blocks (which its SSA
@@ -272,10 +315,14 @@ impl Ir for DxilIr {
             // readfirstlane, writelane's source)
             return self.lw.read_lane_uniform(v, lane);
         }
+        if self.graphics.is_some() {
+            // the hardware lane of a wave32 program's half, a PS's helper lanes through quad reads
+            return self.lw.rla(v, lane);
+        }
         self.lw.s.wave_read_lane_at(v, lane)
     }
     fn read_lane_half(&mut self, v: Value, lane: Value) -> Value {
-        if self.lw.split {
+        if self.lw.split || self.graphics.is_some() {
             return self.lw.read_lane_half(v, lane);
         }
         self.read_lane(v, lane)
@@ -374,6 +421,19 @@ pub fn survey_compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
     let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(insts, wave64, &Entry::Compute(cs.clone())))?;
     Ok(ir.finish(cs.threads, if wave64 { 64 } else { 32 })?.dxil)
+}
+
+/// A vertex shader in its per-lane form, as a signed DXIL container. `lanes32`: a wave64 program
+/// runs in 32-lane hardware waves (`lower::lower_graphics`).
+pub fn vertex(insts: &[Decoded], vs: &super::VsInterface, wave64: bool, lanes32: bool) -> Result<Vec<u8>, String> {
+    let ir = lower::lower_graphics(insts, false, wave64, lanes32, DxilIr::new(insts, wave64, &Entry::Vertex(vs.clone())))?;
+    Ok(ir.finish([1, 1, 1], if wave64 && !lanes32 { 64 } else { 32 })?.dxil)
+}
+
+/// A pixel shader in its per-lane form, as a signed DXIL container (`vertex`'s `lanes32`).
+pub fn pixel(insts: &[Decoded], ps: &super::PsInterface, wave64: bool, lanes32: bool) -> Result<Vec<u8>, String> {
+    let ir = lower::lower_graphics(insts, true, wave64, lanes32, DxilIr::new(insts, wave64, &Entry::Pixel(ps.clone())))?;
+    Ok(ir.finish([1, 1, 1], if wave64 && !lanes32 { 64 } else { 32 })?.dxil)
 }
 
 
@@ -737,5 +797,83 @@ mod tests {
             }
         }
         assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
+    }
+
+    /// A VS and a PS in their per-lane form draw what the HLSL path's stages draw, whichever way a
+    /// branch before their exports goes, and link with the HLSL path's other stage. The exports
+    /// are in the block after the branch and `finish_gfx` in the exit block, so the outputs reach
+    /// it through `Lw`'s SSA (the stages of dxil `core_tests::graphics_stages_with_a_branch_before
+    /// _their_exports`, per lane).
+    #[test]
+    fn per_lane_vs_and_ps_with_a_branch_before_their_exports_draw_as_the_hlsl_path() {
+        use crate::gpu::dxbc::SigElement as S;
+        use crate::gpu::recomp::{PsInterface, VsInterface};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let el = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| S { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 };
+        // s0 != 0 skips the instruction that clears a colour channel
+        let vs: Vec<I> = vec![
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)]),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)]),
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)]),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)]),
+            ("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 0x3), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 0), ("VSRC3", 0)]),
+        ];
+        let vsi = VsInterface {
+            inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)],
+            outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF), el("TEXCOORD", 3, 0, 3, 2, 0x3)],
+            attr_base: 4,
+            params: None,
+        };
+        let ps: Vec<I> = vec![
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)]),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 1)]),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 0)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)]),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)]),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)]),
+        ];
+        let psi = PsInterface {
+            inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF), el("TEXCOORD", 3, 0, 3, 2, 0x3)],
+            outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+            input_ena: 0x302,
+            attrs: None,
+        };
+        let bytes = |lines: &[I]| -> Vec<u8> { lines.iter().flat_map(encode_line).collect() };
+        let hlsl = |lines: &[I], mode: Mode, profile: &str| {
+            let t = translate(&bytes(lines), &Options { mode, wave64: true, ..Default::default() }).unwrap();
+            dxc::compile(&t.hlsl, "main", profile, &[]).unwrap()
+        };
+        let (hvs, hps) = (hlsl(&vs, Mode::Vertex(vsi.clone()), "vs_6_6"), hlsl(&ps, Mode::Pixel(psi.clone()), "ps_6_6"));
+        let lanes32 = runner::graphics_wave32();
+        let pvs = super::vertex(&decode(&vs), &vsi, true, lanes32).unwrap_or_else(|e| panic!("VS: {}", &e[..e.len().min(800)]));
+        let pps = super::pixel(&decode(&ps), &psi, true, lanes32).unwrap_or_else(|e| panic!("PS: {}", &e[..e.len().min(800)]));
+        let c = [0.8f32, 0.6, 0.4, 1.0];
+        let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
+        let layout = [
+            runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+            runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+        ];
+        let draw = |vs: &[u8], ps: &[u8], s0: u32| runner::draw(vs, ps, &layout, &verts, 24, &[s0], &[], 8, [0.0; 4]).unwrap();
+        assert_ne!(draw(&hvs, &hps, 0), draw(&hvs, &hps, 1), "the branch changes the picture");
+        for s0 in [0, 1] {
+            let want = draw(&hvs, &hps, s0);
+            assert_eq!(draw(&pvs, &pps, s0), want, "per-lane VS + PS, s0 = {s0}");
+            assert_eq!(draw(&pvs, &hps, s0), want, "per-lane VS + HLSL PS, s0 = {s0}");
+            assert_eq!(draw(&hvs, &pps, s0), want, "HLSL VS + per-lane PS, s0 = {s0}");
+        }
     }
 }
