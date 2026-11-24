@@ -253,6 +253,9 @@ pub struct Summary {
     pub vector: usize,
     /// pcs of those that still need a guard on the lane's EXEC bit
     pub guarded: Vec<u64>,
+    /// pcs of the mask-width `s_wqm` whose result is every lane (whole-quad mode of the launch
+    /// EXEC, `LaunchExec::Unknown`)
+    pub wqm_all: Vec<u64>,
     /// conditional branches on a lane mask (each lane decides) and on uniform values
     pub lane_branches: usize,
     pub uniform_branches: usize,
@@ -797,6 +800,12 @@ impl<'a> Lanes<'a> {
                         sum.guarded.push(d.pc);
                     }
                 }
+                if d.inst.name == if self.wave64 { "S_WQM_B64" } else { "S_WQM_B32" } {
+                    let s0 = rdna2::field_value(d.enc, &d.words, "SSRC0").unwrap_or(0);
+                    if self.mask_src(&st, d, s0).and_then(|a| self.wqm(a)) == Some(TRUE) {
+                        sum.wqm_all.push(d.pc);
+                    }
+                }
                 self.step_bounded(&mut st, i, b)?;
             }
             let last = &self.insts[end - 1];
@@ -1034,9 +1043,10 @@ mod tests {
         ];
         let s = run_launch(&p, LaunchExec::Unknown).unwrap();
         assert_eq!(s.guarded, vec![16], "only the v_mov after EXEC is narrowed to the launch EXEC again");
+        assert_eq!(s.wqm_all, vec![4]);
         assert_eq!(run_launch(&p, LaunchExec::All).unwrap().guarded.len(), 0);
         // the quads of any other mask are not followed
         let s = run_launch(&[CMP, ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)]), MOV2, ENDPGM], LaunchExec::All).unwrap();
-        assert_eq!(s.guarded, vec![8]);
+        assert_eq!((s.guarded, s.wqm_all), (vec![8], vec![]));
     }
 }

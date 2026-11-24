@@ -106,6 +106,25 @@ pub trait Ir: Sink {
     fn br(&mut self, target: usize);
     fn br_if(&mut self, c: Self::V, then: usize, otherwise: usize);
     fn ret(&mut self);
+    /// VS / PS: the stage's start (in the DXIL adapter #1426's `setup_vertex` / `setup_pixel`),
+    /// with `vregs` the VGPRs the program names. None: this IR has no graphics entry, and the
+    /// program is refused.
+    fn graphics_start(&mut self, vregs: &[u16]) -> Option<GraphicsStart<Self::V>> {
+        let _ = vregs;
+        None
+    }
+    /// … and its end (`finish_gfx`: the outputs, the PS discard), where every lane is back
+    fn graphics_end(&mut self) {}
+}
+
+/// What a VS / PS starts with (`Ir::graphics_start`).
+pub struct GraphicsStart<V> {
+    /// the registers the stage sets beyond the user SGPRs from `io`: (SGPR, value), (VGPR,
+    /// value); a VGPR it does not set starts as 0
+    pub sgprs: Vec<(u8, V)>,
+    pub vgprs: Vec<(u16, V)>,
+    /// the lane's bit of the launch EXEC: false in a PS's helper lanes, which run the program too
+    pub exec: V,
 }
 
 const EXEC: u8 = 126;
@@ -119,6 +138,10 @@ pub enum Stage<'a> {
     /// a compute program: user SGPRs from `io`, then the group ids and TG_SIZE it enables,
     /// thread ids in v0–v2; it ends without storing registers
     Compute(&'a super::CsInterface),
+    /// a vertex / pixel shader: user SGPRs from `io`, the rest from `Ir::graphics_start`; it ends
+    /// in `Ir::graphics_end`
+    Vertex,
+    Pixel,
 }
 
 struct Lower<'a, I: Ir> {
@@ -151,6 +174,20 @@ struct Lower<'a, I: Ir> {
 fn is_store(d: &Decoded) -> bool {
     let n = d.inst.name;
     (n.starts_with("GLOBAL_STORE_") || n.starts_with("FLAT_STORE_")) && matches!(d.enc.name, "ENC_FLAT_GLBL" | "ENC_FLAT")
+}
+
+/// A PS instruction that needs all four lanes of each quad: an image sample or gather with an
+/// implicit LOD (no `_L` / `_LZ`, no gradients `_D` / `_CD`), `image_get_lod`, `s_wqm`. The
+/// console has them from whole-quad mode; DXIL leaves derivatives undefined where control flow is
+/// not uniform over the quad.
+fn whole_quad(name: &str) -> bool {
+    if name == "IMAGE_GET_LOD" || name.starts_with("S_WQM_") {
+        return true;
+    }
+    match name.strip_prefix("IMAGE_SAMPLE").or_else(|| name.strip_prefix("IMAGE_GATHER4")) {
+        Some(rest) => !rest.split('_').any(|t| matches!(t, "L" | "LZ" | "D" | "CD")),
+        None => false,
+    }
 }
 
 /// IR block of analysis block b (block 0 is the prologue).
@@ -348,6 +385,17 @@ impl<'a, I: Ir> Lower<'a, I> {
             return Ok(());
         }
         let width = if self.wave64 { "_B64" } else { "_B32" };
+        // s_wqm: every lane where the analysis found it so (whole-quad mode of the launch EXEC);
+        // any other mask would need the lanes of the quad
+        if name.strip_prefix("S_WQM") == Some(width) {
+            if !self.sum.wqm_all.contains(&d.pc) {
+                return Err(format!("{name} of a mask other than the launch EXEC"));
+            }
+            let t = self.ir.boolean(true);
+            self.write_bit(b, sd, t);
+            self.write_scc(b, t);
+            return Ok(());
+        }
         // mask-width ops: on lane bits when they write EXEC, are a saveexec, or read a mask
         if let Some(base) = name.strip_suffix(width) {
             let op = base.trim_start_matches("S_");
@@ -867,6 +915,16 @@ pub fn lower_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: 
     Ok(lower(insts, Stage::Compute(cs), wave64, ir)?.0)
 }
 
+/// Lowers a vertex or pixel shader (`pixel`; far jumps resolved) into `ir`. `lanes32`: a wave64
+/// program runs in 32-lane hardware waves (NVIDIA), as the HLSL path runs it with `upper_lanes`;
+/// the per-lane form takes such a program only where it reads no lane 32–63 that holds anything.
+pub fn lower_graphics<I: Ir>(insts: &[Decoded], pixel: bool, wave64: bool, lanes32: bool, ir: I) -> R<I> {
+    if wave64 && lanes32 && super::upper_lanes::analyze(insts).reads.values().any(|&r| r != super::upper_lanes::Read::Native) {
+        return Err("wave64 VS / PS in 32-lane waves: a read of lanes 32–63".into());
+    }
+    Ok(lower(insts, if pixel { Stage::Pixel } else { Stage::Vertex }, wave64, ir)?.0)
+}
+
 fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, ir: I) -> R<(I, Vec<u8>)> {
     lower_with(insts, stage, wave64, ir, false).map(|(ir, stale, _)| (ir, stale))
 }
@@ -883,7 +941,10 @@ pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64:
 
 fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
     let kernel = matches!(stage, Stage::Kernel);
-    let sum = lane_masks::analyze(insts, wave64).map_err(|e| e.to_string())?;
+    let graphics = matches!(stage, Stage::Vertex | Stage::Pixel);
+    // a VS / PS: lanes may run outside the launch EXEC (a PS's helper lanes)
+    let launch = if graphics { lane_masks::LaunchExec::Unknown } else { lane_masks::LaunchExec::All };
+    let sum = lane_masks::analyze_launch(insts, wave64, launch).map_err(|e| e.to_string())?;
     let n = sum.blocks.len();
     if n == 0 {
         return Err("empty program".into());
@@ -1061,6 +1122,30 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             l.ssa.seal(&mut l.ir, skip);
             l.ir.ret();
         }
+        Stage::Vertex | Stage::Pixel => {
+            let Some(start) = l.ir.graphics_start(&vregs) else {
+                return Err("VS / PS: this IR has no graphics entry".into());
+            };
+            for &(r, v) in &start.sgprs {
+                l.write_num(0, r, v);
+            }
+            let f = l.ir.boolean(false);
+            l.ssa.write(0, Var::Scc, f);
+            for &v in &vregs {
+                let x = match start.vgprs.iter().find(|x| x.0 == v) {
+                    Some(&(_, x)) => x,
+                    None => l.ir.int(0),
+                };
+                l.ssa.write(0, Var::V(v), x);
+            }
+            // every lane runs the program: a PS's helper lanes with their EXEC bit clear (the
+            // kernel's way out for lanes outside EXEC would leave their quads short)
+            l.write_bit(0, EXEC, start.exec);
+            l.ir.br(blk(0));
+            l.ir.at(skip);
+            l.ssa.seal(&mut l.ir, skip);
+            l.ir.ret();
+        }
     }
 
     // the program, in reverse postorder; a block is sealed once all its predecessors are in
@@ -1083,8 +1168,9 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         if !sealed[ib] {
             sealed[ib] = seal_ready(&mut l, &done, ib);
         }
-        if b == 0 {
-            // the analysis takes the lanes that start the program as its EXEC
+        if b == 0 && !graphics {
+            // the analysis takes the lanes that start the program as its EXEC (a VS / PS keeps
+            // the launch EXEC from its start: there the analysis does not know it)
             let t = l.ir.boolean(true);
             l.write_bit(ib, EXEC, t);
         }
@@ -1097,6 +1183,10 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             let name = d.inst.name;
             if i == last && (name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM")) {
                 break;
+            }
+            if matches!(stage, Stage::Pixel) && whole_quad(name) && l.partial[cur] {
+                l.note_inst(Err(format!("{name}: needs whole quads, in a block not every lane reaches")), cur, d)?;
+                continue;
             }
             if let Some(&(_, s, c)) = split.next_if(|x| x.0 == i) {
                 // a guarded store: only the lanes with their EXEC bit go through its block
@@ -1172,7 +1262,10 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     l.ssa.seal(&mut l.ir, exit);
     let mut stale: Vec<u8> = Vec::new();
     let Some(row) = row else {
-        // compute: nothing to store
+        // compute: nothing to store; a VS / PS: its end
+        if graphics {
+            l.ir.graphics_end();
+        }
         l.ir.ret();
         for b in [sstore, vstore] {
             l.ir.at(b);
@@ -1473,6 +1566,10 @@ pub(crate) mod tests {
         MemLoad(u32),
         MemStore(u32, u32),
         Phi(Vec<(u32, usize)>),
+        /// a VS / PS start: VGPR v from the lane's row of `io` (as in kernel mode), and the
+        /// lane's bit of the launch EXEC from `io[126..=127]`
+        GfxVgpr(u16),
+        GfxExec,
     }
 
     #[derive(Clone, Debug)]
@@ -1618,6 +1715,11 @@ pub(crate) mod tests {
         fn ret(&mut self) {
             self.blocks[self.cur].1 = Term::Ret;
         }
+        fn graphics_start(&mut self, vregs: &[u16]) -> Option<GraphicsStart<u32>> {
+            let vgprs = vregs.iter().map(|&v| (v, self.push(Ins::GfxVgpr(v)))).collect();
+            let exec = self.push(Ins::GfxExec);
+            Some(GraphicsStart { sgprs: Vec::new(), vgprs, exec })
+        }
     }
 
     /// One lane's position: block, instruction index, the block it came from, its values.
@@ -1733,6 +1835,8 @@ pub(crate) mod tests {
                                     res[g(a) as usize] = g(v);
                                     None
                                 }
+                                Ins::GfxVgpr(v) => Some(io[KERNEL_SGPRS + lane * KERNEL_VGPRS + *v as usize]),
+                                Ins::GfxExec => Some(io[EXEC as usize + lane / 32] >> (lane % 32) & 1),
                             };
                             if let Some(r) = r {
                                 s.env.insert(*id, r);
@@ -2388,6 +2492,116 @@ pub(crate) mod tests {
             assert_eq!(regs[1], if l < 8 { 9 } else { 0 }, "lane {l}");
         }
         assert_eq!(s[126], 0xFF);
+    }
+
+    /// A VS / PS run on the CPU in one wave of `lanes` lanes (a wave64 one in 32 lanes: in
+    /// 32-lane waves): `launch` its launch EXEC, `vgpr[lane]` the registers it starts with. The
+    /// memory after.
+    fn run_graphics(lines: &[I], pixel: bool, wave64: bool, lanes: usize, launch: u64, vgpr: &[Vec<u32>], mem: &[u32]) -> Vec<u32> {
+        let ir = lower_graphics(&decode(lines), pixel, wave64, wave64 && lanes == 32, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
+        let mut io = vec![0u32; KERNEL_SGPRS + 64 * KERNEL_VGPRS];
+        io[EXEC as usize] = launch as u32;
+        io[EXEC as usize + 1] = (launch >> 32) as u32;
+        for (l, regs) in vgpr.iter().enumerate().take(lanes) {
+            io[KERNEL_SGPRS + l * KERNEL_VGPRS..][..regs.len()].copy_from_slice(regs);
+        }
+        let mut res = vec![0u32; KERNEL_SGPRS];
+        let mut mem = mem.to_vec();
+        ir.run(lanes, &io, &mut res, &mut mem);
+        mem
+    }
+
+    /// v7 = 9, stored at v[8:9] (the lane's address: 4 × lane)
+    const SET_V7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 137)]);
+    const STORE_V7: I = ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]);
+
+    fn store_rows() -> Vec<Vec<u32>> {
+        (0..64).map(|l| { let mut v = vec![0u32; 10]; v[0] = l; v[1] = 15; v[8] = 4 * l; v }).collect()
+    }
+
+    #[test]
+    fn a_ps_helper_lane_runs_the_program_but_does_not_store() {
+        // even lanes covered, odd lanes helper lanes
+        let launch = 0x5555_5555u64;
+        let want: Vec<u32> = memory_image().iter().enumerate().map(|(l, &m)| if l < 32 && l % 2 == 0 { 9 } else { m }).collect();
+        let exact = run_graphics(&[SET_V7, STORE_V7, ENDPGM], true, false, 32, launch, &store_rows(), &memory_image());
+        assert_eq!(exact, want, "before EXEC is written, the store keeps its guard");
+        // whole-quad mode, then back to the launch EXEC before the store (as compiled PSs do)
+        let wqm32: Vec<I> = vec![
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+            ("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]),
+            SET_V7,
+            ("S_AND_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            STORE_V7,
+            ENDPGM,
+        ];
+        assert_eq!(run_graphics(&wqm32, true, false, 32, launch, &store_rows(), &memory_image()), want);
+        // the same in wave64, run in 32-lane waves
+        let wqm64: Vec<I> = vec![
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+            ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]),
+            SET_V7,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            STORE_V7,
+            ENDPGM,
+        ];
+        assert_eq!(run_graphics(&wqm64, true, true, 32, launch, &store_rows(), &memory_image()), want);
+        // a VS: every lane in the launch EXEC stores
+        let all: Vec<u32> = memory_image().iter().enumerate().map(|(l, &m)| if l < 32 { 9 } else { m }).collect();
+        assert_eq!(run_graphics(&[SET_V7, STORE_V7, ENDPGM], false, false, 32, 0xFFFF_FFFF, &store_rows(), &memory_image()), all);
+    }
+
+    #[test]
+    fn whole_quad_instructions_need_every_lane_of_the_quad() {
+        // v_cmp (lanes above 15); s_and_saveexec s0; s_cbranch_execz L; s_wqm exec, s0; v_mov;
+        // L: exec |= s0 – the s_wqm of the launch EXEC, in a block only some lanes reach
+        let p: Vec<I> = vec![
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]),
+            ("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            SET_V7,
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ENDPGM,
+        ];
+        let e = lower_graphics(&decode(&p), true, false, false, Interp::default()).err();
+        assert_eq!(e.as_deref(), Some("S_WQM_B32: needs whole quads, in a block not every lane reaches"));
+        // s_wqm of another mask: the lanes of the quad are not read
+        let other: Vec<I> = vec![("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]), ("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)]), SET_V7, ENDPGM];
+        let e = lower_graphics(&decode(&other), true, false, false, Interp::default()).err();
+        assert_eq!(e.as_deref(), Some("S_WQM_B32 of a mask other than the launch EXEC"));
+        for (name, quad) in [
+            ("IMAGE_SAMPLE", true),
+            ("IMAGE_SAMPLE_B_CL", true),
+            ("IMAGE_GATHER4_C", true),
+            ("IMAGE_GET_LOD", true),
+            ("S_WQM_B64", true),
+            ("IMAGE_SAMPLE_L", false),
+            ("IMAGE_SAMPLE_C_LZ_O", false),
+            ("IMAGE_SAMPLE_D_G16", false),
+            ("IMAGE_SAMPLE_CD", false),
+            ("IMAGE_GATHER4_LZ", false),
+            ("IMAGE_LOAD", false),
+        ] {
+            assert_eq!(whole_quad(name), quad, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_wave64_vs_in_32_lane_waves_that_reads_upper_lanes_is_refused() {
+        // whole-wave code writes lanes 32–63 (v6 = 5), then v_readlane of lane 32
+        let p: Vec<I> = vec![
+            ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 133)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)]),
+            ENDPGM,
+        ];
+        let insts = decode(&p);
+        assert_eq!(super::super::upper_lanes::analyze(&insts).reads.values().copied().collect::<Vec<_>>(), vec![super::super::upper_lanes::Read::Const(5)]);
+        let e = lower_graphics(&insts, false, true, true, Interp::default()).err();
+        assert_eq!(e.as_deref(), Some("wave64 VS / PS in 32-lane waves: a read of lanes 32–63"));
+        assert!(lower_graphics(&insts, false, true, false, Interp::default()).is_ok(), "in 64-lane waves the lanes are there");
     }
 
     #[test]
