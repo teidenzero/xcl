@@ -1140,8 +1140,10 @@ pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64:
 fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
     let kernel = matches!(stage, Stage::Kernel);
     let graphics = matches!(stage, Stage::Vertex | Stage::Pixel);
-    // a VS / PS: lanes may run outside the launch EXEC (a PS's helper lanes)
-    let launch = if graphics { lane_masks::LaunchExec::Unknown } else { lane_masks::LaunchExec::All };
+    // a PS: lanes may run outside the launch EXEC (its helper lanes); a VS has none, each D3D
+    // vertex invocation being one lane
+    let pixel = matches!(stage, Stage::Pixel);
+    let launch = if pixel { lane_masks::LaunchExec::Unknown } else { lane_masks::LaunchExec::All };
     let sum = lane_masks::analyze_launch(insts, wave64, launch).map_err(|e| e.to_string())?;
     let n = sum.blocks.len();
     if n == 0 {
@@ -1374,9 +1376,9 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         if !sealed[ib] {
             sealed[ib] = seal_ready(&mut l, &done, ib);
         }
-        if b == 0 && !graphics {
-            // the analysis takes the lanes that start the program as its EXEC (a VS / PS keeps
-            // the launch EXEC from its start: there the analysis does not know it)
+        if b == 0 && !pixel {
+            // the analysis takes the lanes that start the program as its EXEC (a PS keeps the
+            // launch EXEC from its start: there the analysis does not know it)
             let t = l.ir.boolean(true);
             l.write_bit(ib, EXEC, t);
         }
@@ -3378,9 +3380,13 @@ pub(crate) mod tests {
             ENDPGM,
         ];
         assert_eq!(run_graphics(&wqm64, true, true, 32, launch, &store_rows(), &memory_image()), want);
-        // a VS: every lane in the launch EXEC stores
+        // a VS: each D3D vertex invocation is one lane, so every lane that runs is in EXEC at
+        // launch and stores, whatever bit its start gives it
         let all: Vec<u32> = memory_image().iter().enumerate().map(|(l, &m)| if l < 32 { 9 } else { m }).collect();
-        assert_eq!(run_graphics(&[SET_V7, STORE_V7, ENDPGM], false, false, 32, 0xFFFF_FFFF, &store_rows(), &memory_image()), all);
+        assert_eq!(run_graphics(&[SET_V7, STORE_V7, ENDPGM], false, false, 32, launch, &store_rows(), &memory_image()), all);
+        // … so its store keeps no guard (no block of its own), where a PS's does
+        let blocks = |pixel: bool| lower_graphics(&decode(&[SET_V7, STORE_V7, ENDPGM]), pixel, false, false, Interp::default()).unwrap().blocks.len();
+        assert_eq!(blocks(false) + 2, blocks(true), "a guarded store adds two blocks: the PS's only");
     }
 
     #[test]
