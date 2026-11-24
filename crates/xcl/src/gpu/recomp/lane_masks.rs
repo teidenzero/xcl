@@ -526,6 +526,7 @@ impl<'a> Lanes<'a> {
                 let value = match (op, a, b) {
                     ("MOV", Some(a), _) => Some(a),
                     ("NOT", Some(a), _) => Some(self.bdd.not(a)?),
+                    ("WQM", Some(a), _) => self.wqm(a),
                     ("CSELECT", Some(a), Some(b)) => match st.scc {
                         Some((u, false)) => {
                             let (ua, nu) = (self.bdd.and(u, a)?, self.bdd.not(u)?);
@@ -574,6 +575,17 @@ impl<'a> Lanes<'a> {
             };
         }
         Ok(())
+    }
+
+    /// `s_wqm` of a mask: the lanes whose quad has a lane in it. Followed only where that is a
+    /// mask the analysis knows: none or every lane, and the launch EXEC (`LaunchExec::Unknown`),
+    /// since a lane that runs outside it is a helper lane of a quad with a lane in it.
+    fn wqm(&mut self, a: B) -> Option<B> {
+        if a <= TRUE {
+            return Some(a);
+        }
+        let launch = *self.atoms.get(&Atom::Launch)?;
+        (a == self.bdd.atom(launch)).then_some(TRUE)
     }
 
     fn kill(&self, st: &mut State, r: usize) {
@@ -1006,5 +1018,25 @@ mod tests {
         assert_eq!(run_launch(&p, LaunchExec::All).unwrap().guarded.len(), 0);
         let s = run_launch(&p, LaunchExec::Unknown).unwrap();
         assert_eq!((s.vector, s.guarded.clone(), s.lane_branches), (2, vec![20], 1));
+    }
+
+    #[test]
+    fn whole_quad_mode_of_the_launch_exec_is_every_lane() {
+        // s[0:1] = exec; s_wqm exec, exec; v_mov (helper lanes too); exec &= s[0:1]; v_mov
+        let wqm: I = ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]);
+        let p: [I; 6] = [
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+            wqm,
+            MOV2,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            MOV3,
+            ENDPGM,
+        ];
+        let s = run_launch(&p, LaunchExec::Unknown).unwrap();
+        assert_eq!(s.guarded, vec![16], "only the v_mov after EXEC is narrowed to the launch EXEC again");
+        assert_eq!(run_launch(&p, LaunchExec::All).unwrap().guarded.len(), 0);
+        // the quads of any other mask are not followed
+        let s = run_launch(&[CMP, ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)]), MOV2, ENDPGM], LaunchExec::All).unwrap();
+        assert_eq!(s.guarded, vec![8]);
     }
 }
